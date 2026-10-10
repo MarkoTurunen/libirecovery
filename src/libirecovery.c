@@ -2147,7 +2147,7 @@ static irecv_error_t libusb_open_with_ecid(irecv_client_t* pclient, uint64_t eci
 #endif
 #endif
 
-irecv_error_t irecv_open_with_ecid(irecv_client_t* pclient, uint64_t ecid)
+static irecv_error_t irecv_open_with_ecid_once(irecv_client_t* pclient, uint64_t ecid)
 {
 #ifdef USE_DUMMY
 	return IRECV_E_UNSUPPORTED;
@@ -2239,6 +2239,19 @@ irecv_error_t irecv_open_with_ecid(irecv_client_t* pclient, uint64_t ecid)
 	}
 	return error;
 #endif
+}
+
+irecv_error_t irecv_open_with_ecid(irecv_client_t* pclient, uint64_t ecid)
+{
+	irecv_error_t error = irecv_open_with_ecid_once(pclient, ecid);
+	if (error != IRECV_E_SUCCESS) {
+		/* Every failure path has already freed the client. Don't leave a
+		 * dangling pointer behind, irecv_open_with_ecid_and_attempts() would
+		 * close it again on the next attempt (e.g. when a device detaches
+		 * while it is being opened). */
+		*pclient = NULL;
+	}
+	return error;
 }
 
 irecv_error_t irecv_usb_set_configuration(irecv_client_t client, int configuration)
