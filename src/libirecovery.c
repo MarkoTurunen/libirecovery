@@ -104,7 +104,9 @@ struct irecv_async_transfer {
  #ifdef HAVE_IOKIT
  	kern_return_t ret;
  #else
+ #ifndef USE_DUMMY
  	enum libusb_transfer_status ret;
+ #endif
  #endif
 };
 
@@ -237,6 +239,9 @@ static struct irecv_device irecv_devices[] = {
 	{ "iPhone18,3",  "v57ap",    0x08, 0x8150, "iPhone 17" },
 	{ "iPhone18,4",  "d23ap",    0x0A, 0x8150, "iPhone Air" },
 	{ "iPhone18,5",  "v159ap",   0x16, 0x8150, "iPhone 17e" },
+	{ "iPhone19,2",  "v63ap",    0x0A, 0x8160, "iPhone 18 Pro" },
+	{ "iPhone19,3",  "v64ap",    0x0C, 0x8160, "iPhone 18 Pro Max (US)" },
+	{ "iPhone19,7",  "v64sap",    0x12, 0x8160, "iPhone 18 Pro Max (Global)" },
 	/* iPod */
 	{ "iPod1,1",     "n45ap",    0x02, 0x8900, "iPod Touch (1st gen)" },
 	{ "iPod2,1",     "n72ap",    0x00, 0x8720, "iPod Touch (2nd gen)" },
@@ -345,9 +350,9 @@ static struct irecv_device irecv_devices[] = {
 	{ "iPad16,4",    "j718ap",   0x0A, 0x8132, "iPad Pro 11-inch (M4, Cellular)" },
 	{ "iPad16,5",    "j720ap",   0x0C, 0x8132, "iPad Pro 13-inch (M4, WiFi)" },
 	{ "iPad16,6",    "j721ap",   0x0E, 0x8132, "iPad Pro 13-inch (M4, Cellular)" },
-	{ "iPad16,8",    "j707ap",   0x10, 0x8132, "iPad Air 11-inch (M4, Wi-Fi)" },
+	{ "iPad16,8",    "j707ap",   0x10, 0x8132, "iPad Air 11-inch (M4, WiFi)" },
 	{ "iPad16,9",    "j708ap",   0x12, 0x8132, "iPad Air 11-inch (M4, Cellular)" },
-	{ "iPad16,10",   "j737ap",   0x14, 0x8132, "iPad Air 13-inch (M4, Wi-Fi)" },
+	{ "iPad16,10",   "j737ap",   0x14, 0x8132, "iPad Air 13-inch (M4, WiFi)" },
 	{ "iPad16,11",   "j738ap",   0x16, 0x8132, "iPad Air 13-inch (M4, Cellular)" },
 	{ "iPad17,1",    "j817ap",   0x08, 0x8142, "iPad Pro 11-inch (M5, WiFi)" },
 	{ "iPad17,2",    "j818ap",   0x0A, 0x8142, "iPad Pro 11-inch (M5, Cellular)" },
@@ -424,6 +429,11 @@ static struct irecv_device irecv_devices[] = {
 	{ "Watch7,18",   "n227bap", 0x1A, 0x8310, "Apple Watch Series 11 (46mm)" },
 	{ "Watch7,19",   "n228sap", 0x1C, 0x8310, "Apple Watch Series 11 (42mm Cellular)" },
 	{ "Watch7,20",   "n228bap", 0x1E, 0x8310, "Apple Watch Series 11 (46mm Cellular)" },
+	{ "Watch8,1",    "n240ap",  0x02, 0x8320, "Apple Watch Ultra 4" },
+	{ "Watch8,2",    "n237sap", 0x08, 0x8320, "Apple Watch Series 12 (42mm)" },
+	{ "Watch8,3",    "n237bap", 0x0A, 0x8320, "Apple Watch Series 12 (46mm)" },
+	{ "Watch8,4",    "n238sap", 0x0C, 0x8320, "Apple Watch Series 12 (42mm Cellular)" },
+	{ "Watch8,5",    "n238bap", 0x0E, 0x8320, "Apple Watch Series 12 (46mm Cellular)" },
 	/* Apple Silicon Macs */
 	{ "ADP3,2",         "j273aap", 0x42, 0x8027, "Developer Transition Kit (2020)" },
 	{ "Macmini9,1",	    "j274ap",  0x22, 0x8103, "Mac mini (M1, 2020)" },
@@ -474,13 +484,17 @@ static struct irecv_device irecv_devices[] = {
 	{ "Mac16,12",       "j713ap",  0x2C, 0x8132, "MacBook Air (13-inch, M4, 2025)" },
 	{ "Mac16,13",       "j715ap",  0x2E, 0x8132, "MacBook Air (15-inch, M4, 2025)" },
 	{ "Mac17,2",        "j704ap",  0x22, 0x8142, "MacBook Pro (14-inch, M5, 2025)" },
-	{ "Mac17,3",        "j813ap",  0x24, 0x8142, "MacBook Air (13-inch, M5)" },
-	{ "Mac17,4",        "j815ap",  0x26, 0x8142, "MacBook Air (15-inch, M5)" },
+	{ "Mac17,3",        "j813ap",  0x24, 0x8142, "MacBook Air (13-inch, M5, 2026)" },
+	{ "Mac17,4",        "j815ap",  0x26, 0x8142, "MacBook Air (15-inch, M5, 2026)" },
 	{ "Mac17,5",        "j700ap",  0x64, 0x8140, "MacBook Neo" },
-	{ "Mac17,6",        "j716cap", 0x0E, 0x6050, "MacBook Pro (16-inch, M5 Max)" },
-	{ "Mac17,7",        "j714cap", 0x0A, 0x6050, "MacBook Pro (14-inch, M5 Max)" },
-	{ "Mac17,8",        "j716sap", 0x0C, 0x6050, "MacBook Pro (16-inch, M5 Pro)" },
-	{ "Mac17,9",        "j714sap", 0x08, 0x6050, "MacBook Pro (14-inch, M5 Pro)" },
+	{ "Mac17,6",        "j716cap", 0x0E, 0x6050, "MacBook Pro (16-inch, M5 Max, 2026)" },
+	{ "Mac17,7",        "j714cap", 0x0A, 0x6050, "MacBook Pro (14-inch, M5 Max, 2026)" },
+	{ "Mac17,8",        "j716sap", 0x0C, 0x6050, "MacBook Pro (16-inch, M5 Pro, 2026)" },
+	{ "Mac17,9",        "j714sap", 0x08, 0x6050, "MacBook Pro (14-inch, M5 Pro, 2026)" },
+	{ "Mac17,14",       "j775cap", 0x10, 0x6050, "Mac Studio (M5 Max, 2026)" },
+	{ "Mac17,15",       "j775dap", 0x12, 0x6050, "Mac Studio (M5 Ultra, 2026)" },
+	{ "Mac17,16",       "j873sap", 0x02, 0x6050, "Mac mini (M5 Pro, 2026)" },
+	{ "Mac18,5",        "j873gap", 0x24, 0x6050, "Mac mini (M6, 2026)" },
 	/* Apple Silicon VMs (supported by Virtualization.framework on macOS 12) */
 	{ "VirtualMac2,1",  "vma2macosap",  0x20, 0xFE00, "Apple Virtual Machine 1" },
 	/* Apple T2 Coprocessor */
@@ -500,8 +514,13 @@ static struct irecv_device irecv_devices[] = {
 	{ "iBridge2,20", "j185fap",  0x23, 0x8012, "Apple T2 iMac20,2 (j185f)" },
 	{ "iBridge2,21", "j223ap",   0x3B, 0x8012, "Apple T2 MacBookPro16,3 (j223)" },
 	{ "iBridge2,22", "j215ap",   0x38, 0x8012, "Apple T2 MacBookPro16,4 (j215)" },
+	/* Lightning Video Adapters */
+	{ "iAccy1,1", "b137ap", 0x00, 0x8747, "Lightning Digital AV Adapter" },
+	{ "iAccy1,2", "b165ap", 0x02, 0x8747, "Lightning to VGA Adapter" },
 	/* Apple Displays */
 	{ "AppleDisplay2,1", "j327ap", 0x22, 0x8030, "Studio Display" },
+	{ "AppleDisplay18,1", "j427ap", 0x02, 0x8150, "Studio Display XDR" },
+	{ "AppleDisplay18,2", "j527ap", 0x04, 0x8150, "Studio Display (2026)" },
 	/* Apple Vision Pro */
 	{ "RealityDevice14,1", "n301ap", 0x42, 0x8112, "Apple Vision Pro" },
 	{ "RealityDevice17,1", "n301aap", 0x42, 0x8142, "Apple Vision Pro (M5)" },
@@ -832,7 +851,7 @@ static void irecv_load_device_info_from_iboot_string(irecv_client_t client, cons
 		return;
 	}
 
-	memset(&client->device_info, '\0', sizeof(struct irecv_device_info));
+	memset(&client->device_info, 0, sizeof(struct irecv_device_info));
 
 	client->device_info.serial_string = strdup(iboot_string);
 
@@ -1264,7 +1283,7 @@ static irecv_error_t win32_open_with_ecid(irecv_client_t* client, uint64_t ecid)
 		DWORD i;
 		SP_DEVICE_INTERFACE_DATA currentInterface;
 		HDEVINFO usbDevices = SetupDiGetClassDevs(guids[k], NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-		memset(&currentInterface, '\0', sizeof(SP_DEVICE_INTERFACE_DATA));
+		memset(&currentInterface, 0, sizeof(SP_DEVICE_INTERFACE_DATA));
 		currentInterface.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
 		for (i = 0; usbDevices && SetupDiEnumDeviceInterfaces(usbDevices, NULL, guids[k], i, &currentInterface); i++) {
 			_client->handle = INVALID_HANDLE_VALUE;
@@ -1416,7 +1435,7 @@ static int iokit_usb_control_transfer(irecv_client_t client, uint8_t bm_request_
 	IOReturn result;
 	IOUSBDevRequestTO req;
 
-	bzero(&req, sizeof(req));
+	memset(&req, 0, sizeof(req));
 	req.bmRequestType     = bm_request_type;
 	req.bRequest          = b_request;
 	req.wValue            = OSSwapLittleToHostInt16(w_value);
@@ -1519,7 +1538,7 @@ static int iokit_async_usb_control_transfer(irecv_client_t client, uint8_t bm_re
 	IOReturn result;
 	IOUSBDevRequest req;
 
-	bzero(&req, sizeof(req));
+	memset(&req, 0, sizeof(req));
 	req.bmRequestType     = bm_request_type;
 	req.bRequest          = b_request;
 	req.wValue            = OSSwapLittleToHostInt16(w_value);
@@ -1540,6 +1559,7 @@ static int iokit_async_usb_control_transfer(irecv_client_t client, uint8_t bm_re
 }
 
 #else
+#ifndef USE_DUMMY
 
 static void async_cb(struct libusb_transfer* usb_transfer) {
 	struct irecv_async_transfer* transfer = usb_transfer->user_data;
@@ -1547,6 +1567,7 @@ static void async_cb(struct libusb_transfer* usb_transfer) {
 	transfer->len += usb_transfer->actual_length;
 }
 
+#endif
 #endif
 #endif
 
@@ -1595,7 +1616,7 @@ IRECV_API int irecv_async_usb_control_transfer_with_cancel(irecv_client_t client
 #ifndef _WIN32
 	irecv_error_t error;
 	struct irecv_async_transfer transfer;
-	bzero(&transfer, sizeof(struct irecv_async_transfer));
+	memset(&transfer, 0, sizeof(struct irecv_async_transfer));
 
 #ifdef HAVE_IOKIT
 
@@ -2035,7 +2056,7 @@ static irecv_error_t libusb_usb_open_handle_with_descriptor_and_ecid(irecv_clien
 		return IRECV_E_OUT_OF_MEMORY;
 	}
 
-	memset(client, '\0', sizeof(struct irecv_client_private));
+	memset(client, 0, sizeof(struct irecv_client_private));
 	client->usb_interface = 0;
 	client->handle = usb_handle;
 	client->mode = usb_descriptor->idProduct;
@@ -2646,7 +2667,7 @@ static void* _irecv_handle_device_add(void *userdata)
 			debug("%s: Failed to allocate memory\n", __func__);
 			return NULL;
 		}
-		memset(client, '\0', sizeof(struct irecv_client_private));
+		memset(client, 0, sizeof(struct irecv_client_private));
 		client->handle = CreateFileA(result, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
 		if (client->handle == INVALID_HANDLE_VALUE) {
 			debug("%s: Failed to open device path %s\n", __func__, result);
@@ -2701,9 +2722,9 @@ static void* _irecv_handle_device_add(void *userdata)
 	}
 
 	if (product_id == KIS_PRODUCT_ID) {
-		IOObjectRetain(device);
 		int i = 0;
 		for (i = 0; i < 10; i++) {
+			IOObjectRetain(device);
 			error = iokit_usb_open_service(&client, device);
 			if (error == IRECV_E_SUCCESS) {
 				break;
@@ -2765,7 +2786,7 @@ static void* _irecv_handle_device_add(void *userdata)
 	}
 #endif /* !HAVE_IOKIT */
 #endif /* !_WIN32 */
-	memset(&client_loc, '\0', sizeof(client_loc));
+	memset(&client_loc, 0, sizeof(client_loc));
 	if (product_id == KIS_PRODUCT_ID) {
 		int i = 0;
 		for (i = 0; i < 10; i++) {
@@ -3010,7 +3031,7 @@ static void *_irecv_event_handler(void* data)
 			}
 
 
-			memset(&currentInterface, '\0', sizeof(SP_DEVICE_INTERFACE_DATA));
+			memset(&currentInterface, 0, sizeof(SP_DEVICE_INTERFACE_DATA));
 			currentInterface.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
 			for (i = 0; usbDevices && SetupDiEnumDeviceInterfaces(usbDevices, NULL, guids[k], i, &currentInterface); i++) {
 				DWORD requiredSize = 0;
@@ -3595,7 +3616,7 @@ static irecv_error_t irecv_get_status(irecv_client_t client, unsigned int* statu
 	}
 
 	unsigned char buffer[6];
-	memset(buffer, '\0', sizeof(buffer));
+	memset(buffer, 0, sizeof(buffer));
 	if (irecv_usb_control_transfer(client, 0xA1, 3, 0, 0, buffer, sizeof(buffer), USB_TIMEOUT) != sizeof(buffer)) {
 		*status = 0;
 		return IRECV_E_USB_STATUS;
@@ -3944,7 +3965,7 @@ irecv_error_t irecv_receive(irecv_client_t client)
 	return IRECV_E_UNSUPPORTED;
 #else
 	char buffer[BUFFER_SIZE];
-	memset(buffer, '\0', BUFFER_SIZE);
+	memset(buffer, 0, BUFFER_SIZE);
 
 	if (check_context(client) != IRECV_E_SUCCESS)
 		return IRECV_E_NO_DEVICE;
@@ -3994,7 +4015,7 @@ irecv_error_t irecv_getenv(irecv_client_t client, const char* variable, char** v
 		return IRECV_E_UNSUPPORTED;
 	}
 
-	memset(command, '\0', sizeof(command));
+	memset(command, 0, sizeof(command));
 	snprintf(command, sizeof(command)-1, "getenv %s", variable);
 	irecv_error_t error = irecv_send_command_raw(client, command, 0);
 	if (error == IRECV_E_PIPE) {
@@ -4011,7 +4032,7 @@ irecv_error_t irecv_getenv(irecv_client_t client, const char* variable, char** v
 		return IRECV_E_OUT_OF_MEMORY;
 	}
 
-	memset(response, '\0', rsize);
+	memset(response, 0, rsize);
 	irecv_usb_control_transfer(client, 0xC0, 0, 0, 0, (unsigned char*) response, rsize-1, USB_TIMEOUT);
 
 	*value = response;
@@ -4036,7 +4057,7 @@ irecv_error_t irecv_getret(irecv_client_t client, unsigned int* value)
 		return IRECV_E_OUT_OF_MEMORY;
 	}
 
-	memset(response, '\0', rsize);
+	memset(response, 0, rsize);
 	irecv_usb_control_transfer(client, 0xC0, 0, 0, 0, (unsigned char*) response, rsize-1, USB_TIMEOUT);
 
 	*value = (unsigned int) *response;
@@ -4099,7 +4120,7 @@ irecv_error_t irecv_trigger_limera1n_exploit(irecv_client_t client)
 #ifdef HAVE_IOKIT
 	IOReturn result;
 	IOUSBDevRequestTO req;
-	bzero(&req, sizeof(req));
+	memset(&req, 0, sizeof(req));
 
 	req.bmRequestType     = 0x21;
 	req.bRequest          = 2;
@@ -4201,7 +4222,7 @@ irecv_error_t irecv_setenv(irecv_client_t client, const char* variable, const ch
 		return IRECV_E_UNKNOWN_ERROR;
 	}
 
-	memset(command, '\0', sizeof(command));
+	memset(command, 0, sizeof(command));
 	snprintf(command, sizeof(command)-1, "setenv %s %s", variable, value);
 	irecv_error_t error = irecv_send_command_raw(client, command, 0);
 	if (error != IRECV_E_SUCCESS) {
@@ -4226,7 +4247,7 @@ irecv_error_t irecv_setenv_np(irecv_client_t client, const char* variable, const
 		return IRECV_E_UNKNOWN_ERROR;
 	}
 
-	memset(command, '\0', sizeof(command));
+	memset(command, 0, sizeof(command));
 	snprintf(command, sizeof(command)-1, "setenvnp %s %s", variable, value);
 	irecv_error_t error = irecv_send_command_raw(client, command, 0);
 	if (error != IRECV_E_SUCCESS) {
