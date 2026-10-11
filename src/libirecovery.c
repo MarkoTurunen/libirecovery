@@ -119,6 +119,7 @@ struct irecv_client_private {
 	int usb_alt_interface;
 	unsigned int mode;
 	int isKIS;
+	uint64_t kis_rambase; /* KIS payload base address reported by the device; images are loaded there */
 	struct irecv_device_info device_info;
 #ifndef USE_DUMMY
 #ifndef _WIN32
@@ -1218,6 +1219,11 @@ static irecv_error_t irecv_kis_load_device_info(irecv_client_t client)
 		debug("Failed to send KIS request, error %d\n", err);
 		return err;
 	}
+
+	/* The ROM loads uploaded images at rambase. It is 0 on some devices and not on
+	 * others (0x10000000000 on a MacBook Neo); macOS uploads to rambase + offset. */
+	client->kis_rambase = di.rambase;
+	debug("KIS payload base address: 0x%" PRIx64 ", capacity: %u\n", (uint64_t)di.rambase, di.maxUploadSize);
 
 	char buf[0x100];
 	int len = 0;
@@ -3649,7 +3655,7 @@ static irecv_error_t irecv_kis_send_buffer(irecv_client_t client, unsigned char*
 	unsigned long origLen = length;
 
 	KIS_upload_chunk *chunk = calloc(1, sizeof(KIS_upload_chunk));
-	uint64_t address = 0;
+	uint64_t address = client->kis_rambase;
 	while (length) {
 		unsigned long toUpload = length;
 		if (toUpload > 0x4000)
