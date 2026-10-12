@@ -749,6 +749,15 @@ struct collection listeners;
 static mutex_t listener_mutex;
 struct collection devices;
 static mutex_t device_mutex;
+#ifdef HAVE_KIS_RSM
+/* A KIS request is a bulk OUT followed by its bulk IN reply. The RSM watcher may send requests on a
+ * handle a client is using, so requests are serialized. */
+static mutex_t kis_request_mutex;
+/* Open Recovery-over-RSM clients by location, so the watcher can check a device a client holds */
+#define RSM_MAX_CLIENTS 16
+static struct { uint32_t location; irecv_client_t client; } rsm_clients[RSM_MAX_CLIENTS];
+static mutex_t rsm_clients_mutex;
+#endif
 #ifndef _WIN32
 #ifdef HAVE_IOKIT
 static CFRunLoopRef iokit_runloop = NULL;
@@ -788,6 +797,10 @@ INITIALIZER(_irecv_init)
 #endif
 	collection_init(&listeners);
 	mutex_init(&listener_mutex);
+#endif
+#ifdef HAVE_KIS_RSM
+	mutex_init(&kis_request_mutex);
+	mutex_init(&rsm_clients_mutex);
 #endif
 	atexit(_irecv_deinit);
 }
@@ -1135,27 +1148,28 @@ static irecv_error_t irecv_kis_request(irecv_client_t client, KIS_req_header *re
 	}
 
 	int sent = 0;
+#ifdef HAVE_KIS_RSM
+	mutex_lock(&kis_request_mutex);
+#endif
 	irecv_error_t err = irecv_kis_bulk_transfer(client, endpoint, (unsigned char *) req, reqSize, &sent, USB_TIMEOUT);
 	if (err != IRECV_E_SUCCESS) {
 		debug("[send] irecv_usb_bulk_transfer failed, error %d\n", err);
-		return err;
-	}
-
-	if ((size_t) sent != reqSize) {
+	} else if ((size_t) sent != reqSize) {
 		debug("sent != reqSize\n");
-		return IRECV_E_USB_UPLOAD;
+		err = IRECV_E_USB_UPLOAD;
+	} else {
+		int rcvd = 0;
+		err = irecv_kis_bulk_transfer(client, endpoint | 0x80, (unsigned char *) rpl, *rplSize, &rcvd, USB_TIMEOUT);
+		if (err != IRECV_E_SUCCESS) {
+			debug("[rcv] irecv_usb_bulk_transfer failed, error %d\n", err);
+		} else {
+			*rplSize = rcvd;
+		}
 	}
-
-	int rcvd = 0;
-	err = irecv_kis_bulk_transfer(client, endpoint | 0x80, (unsigned char *) rpl, *rplSize, &rcvd, USB_TIMEOUT);
-	if (err != IRECV_E_SUCCESS) {
-		debug("[rcv] irecv_usb_bulk_transfer failed, error %d\n", err);
-		return err;
-	}
-
-	*rplSize = rcvd;
-
-	return IRECV_E_SUCCESS;
+#ifdef HAVE_KIS_RSM
+	mutex_unlock(&kis_request_mutex);
+#endif
+	return err;
 }
 
 static irecv_error_t irecv_kis_config_write32(irecv_client_t client, uint8_t portal, uint16_t index, uint32_t value)
@@ -1638,6 +1652,42 @@ static irecv_error_t irecv_rsm_open(irecv_client_t client, const uint32_t *bells
 	debug("KIS RSM: Recovery device %04x on channel %d (H2D 0x%" PRIx64 ", D2H 0x%" PRIx64 "%s)\n",
 	      product, ch, client->rsm_h2d, client->rsm_d2h, host == 0 ? ", attached" : ", resumed");
 	return IRECV_E_SUCCESS;
+}
+
+static uint32_t rsm_handle_location(libusb_device_handle *handle)
+{
+	libusb_device *device = libusb_get_device(handle);
+	return device ? ((libusb_get_bus_number(device) << 16) | libusb_get_device_address(device)) : 0;
+}
+
+/* Remembers an open Recovery-over-RSM client: idevicerestore keeps the client open while it waits
+ * for the device to "disconnect" (e.g. after bootx), so the watcher must check the device through
+ * this client's handle. */
+static void rsm_register_client(irecv_client_t client)
+{
+	int i;
+	mutex_lock(&rsm_clients_mutex);
+	for (i = 0; i < RSM_MAX_CLIENTS; i++) {
+		if (!rsm_clients[i].client) {
+			rsm_clients[i].client = client;
+			rsm_clients[i].location = rsm_handle_location(client->handle);
+			break;
+		}
+	}
+	mutex_unlock(&rsm_clients_mutex);
+}
+
+static void rsm_unregister_client(irecv_client_t client)
+{
+	int i;
+	mutex_lock(&rsm_clients_mutex);
+	for (i = 0; i < RSM_MAX_CLIENTS; i++) {
+		if (rsm_clients[i].client == client) {
+			rsm_clients[i].client = NULL;
+			rsm_clients[i].location = 0;
+		}
+	}
+	mutex_unlock(&rsm_clients_mutex);
 }
 #endif
 
@@ -2735,6 +2785,11 @@ static irecv_error_t irecv_open_with_ecid_once(irecv_client_t* pclient, uint64_t
 		irecv_copy_nonce_with_tag(client, "SNON", &client->device_info.sep_nonce, &client->device_info.sep_nonce_size);
 	}
 
+#ifdef HAVE_KIS_RSM
+	if (error == IRECV_E_SUCCESS && client->rsm) {
+		rsm_register_client(client);
+	}
+#endif
 	if (error == IRECV_E_SUCCESS) {
 		if ((*pclient)->connected_callback != NULL) {
 			irecv_event_t event;
@@ -3556,17 +3611,37 @@ static unsigned int _irecv_rsm_current_mode(libusb_device *device, unsigned int 
 {
 	*attached = 0;
 	struct libusb_device_handle *handle = NULL;
-	if (libusb_open(device, &handle) != 0 || !handle) {
-		return 0;
-	}
-	if (libusb_claim_interface(handle, 0) != 0) {
-		libusb_close(handle);
-		return 0;
+	int borrowed = 0;
+	if (libusb_open(device, &handle) != 0 || !handle || libusb_claim_interface(handle, 0) != 0) {
+		if (handle) {
+			libusb_close(handle);
+			handle = NULL;
+		}
+		/* A client of this process has the device open: check it through that client's handle.
+		 * rsm_clients_mutex stays locked so the client cannot close the handle meanwhile. */
+		uint32_t location = (libusb_get_bus_number(device) << 16) | libusb_get_device_address(device);
+		int i;
+		mutex_lock(&rsm_clients_mutex);
+		for (i = 0; i < RSM_MAX_CLIENTS; i++) {
+			if (rsm_clients[i].client && rsm_clients[i].location == location) {
+				handle = rsm_clients[i].client->handle;
+				break;
+			}
+		}
+		if (!handle) {
+			mutex_unlock(&rsm_clients_mutex);
+			return 0;
+		}
+		borrowed = 1;
 	}
 	irecv_client_t client = (irecv_client_t)calloc(1, sizeof(struct irecv_client_private));
 	if (!client) {
-		libusb_release_interface(handle, 0);
-		libusb_close(handle);
+		if (borrowed) {
+			mutex_unlock(&rsm_clients_mutex);
+		} else {
+			libusb_release_interface(handle, 0);
+			libusb_close(handle);
+		}
 		return 0;
 	}
 	client->handle = handle;
@@ -3598,8 +3673,17 @@ static unsigned int _irecv_rsm_current_mode(libusb_device *device, unsigned int 
 			mode = KIS_PRODUCT_ID;
 		}
 	}
-	/* releases interface 0 and closes the handle */
-	irecv_close(client);
+	if (borrowed) {
+		/* the handle belongs to another client: only free this one (it was never registered, and
+		 * rsm_clients_mutex is held here) */
+		client->handle = NULL;
+		client->rsm = 0;
+		irecv_close(client);
+		mutex_unlock(&rsm_clients_mutex);
+	} else {
+		/* releases interface 0 and closes the handle */
+		irecv_close(client);
+	}
 	return mode;
 }
 
@@ -4092,6 +4176,12 @@ static irecv_error_t irecv_cleanup(irecv_client_t client)
 			CFRelease(client->async_event_source);
 		}
 #else
+#ifdef HAVE_KIS_RSM
+		if (client->rsm) {
+			/* waits until the watcher is done with this client's handle */
+			rsm_unregister_client(client);
+		}
+#endif
 		if (client->handle != NULL) {
 			if ((client->mode != IRECV_K_DFU_MODE) && (client->mode != IRECV_K_PORT_DFU_MODE) && (client->mode != IRECV_K_WTF_MODE) && (client->isKIS == 0)) {
 				libusb_release_interface(client->handle, client->usb_interface);
