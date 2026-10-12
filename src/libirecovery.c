@@ -120,6 +120,16 @@ struct irecv_client_private {
 	unsigned int mode;
 	int isKIS;
 	uint64_t kis_rambase; /* KIS payload base address reported by the device; images are loaded there */
+	/* Recovery over a KIS RSM channel (MacBook Neo): USB transfers go through rings in device memory */
+	int rsm;
+	int rsm_waiting;   /* KIS device running a booted image without a Recovery channel (yet) */
+	int rsm_ch;
+	uint32_t rsm_desc;
+	uint64_t rsm_h2d;  /* host-to-device ring */
+	uint64_t rsm_d2h;  /* device-to-host ring */
+	uint32_t rsm_hw;   /* host write offset in the H2D ring (bytes) */
+	uint32_t rsm_dr;   /* host read offset in the D2H ring (bytes) */
+	uint32_t rsm_drp;  /* device read offset in the H2D ring as last reported (4 KiB granularity) */
 	struct irecv_device_info device_info;
 #ifndef USE_DUMMY
 #ifndef _WIN32
@@ -159,6 +169,28 @@ struct irecv_client_private {
 
 #define KIS_ENABLE_A_VAL   0x21 // Value to write to KIS_INDEX_ENABLE_A
 #define KIS_ENABLE_B_VAL   0x01 // Value to write to KIS_INDEX_ENABLE_B
+
+/* KIS RSM channels. On a MacBook Neo, iBoot's Recovery device is not a separate USB device:
+ * after the iBSS boot it is tunnelled through rings in device memory, which the host writes and
+ * reads with KIS memory requests and signals with doorbells. The device announces the channel
+ * in its doorbells (read with KIS_INDEX_GET_INFO). Protocol notes: YWME repository,
+ * .claude/skills/apple-device-bringup/reference.md, "Wire protocol". */
+#if !defined(USE_DUMMY) && !defined(_WIN32) && !defined(HAVE_IOKIT)
+#define HAVE_KIS_RSM 1
+#endif
+#define KIS_INDEX_PORTAL_ENABLE 0x16    // config portal: bit n enables portal n
+#define KIS_PORTAL_ENABLE_RSM   0x30000 // macOS writes this after the iBSS boot (portals 0x10 and 0x11)
+#define KIS_INFO_TAG_DFU        0x61444655 // 'UFDa' in doorbell 0: boot ROM
+#define RSM_MAGIC               0x52534D31 // 'RSM1' in doorbell 0: RSM channels available
+#define RSM_DB_CHAN_DESC   16  // + ch: channel type << 24 | flags
+#define RSM_DB_H2D_BASE    32  // + 2 * ch: host-to-device ring base, lo/hi
+#define RSM_DB_D2H_BASE    64  // + 2 * ch: device-to-host ring base, lo/hi
+#define RSM_DB_HOST_WP     96  // + ch: written by the host: H2D write offset in words, D2H read offset in 4 KiB pages << 24
+#define RSM_DB_DEVICE_WP   112 // + ch: written by the device: D2H write offset in words, H2D read offset in 4 KiB pages << 24
+#define RSM_CHANNEL_RECOVERY 2
+#define RSM_RING_SIZE      0x100000
+#define RSM_MAX_ENTRY      0x8000
+#define RSM_RING_MARGIN    0x10000
 
 #define BUFFER_SIZE 0x1000
 #define debug(...) if (libirecovery_debug) fprintf(stderr, __VA_ARGS__)
@@ -815,11 +847,18 @@ static int irecv_get_string_descriptor_ascii(irecv_client_t client, uint8_t desc
 #ifdef HAVE_IOKIT
 	return iokit_get_string_descriptor_ascii(client, desc_index, buffer, size);
 #else
-	return libusb_get_string_descriptor_ascii(client->handle, desc_index, buffer, size);
+	if (!client->rsm) {
+		return libusb_get_string_descriptor_ascii(client->handle, desc_index, buffer, size);
+	}
+	/* Recovery over a KIS RSM channel: GET_DESCRIPTOR through the channel, as macOS does */
+	int ret;
+	unsigned short langid = 0x0409;
 #endif
 #else
 	irecv_error_t ret;
 	unsigned short langid = 0;
+#endif
+#if defined(_WIN32) || !defined(HAVE_IOKIT)
 	unsigned char data[256];
 	int di, si;
 	memset(data, 0, sizeof(data));
@@ -1066,6 +1105,20 @@ static irecv_error_t irecv_kis_request_init(KIS_req_header *hdr, uint8_t portal,
 	return IRECV_E_SUCCESS;
 }
 
+/* KIS requests always go to the KIS device itself, never through an RSM channel. */
+static int irecv_kis_bulk_transfer(irecv_client_t client, unsigned char endpoint, unsigned char *data, int length, int *transferred, unsigned int timeout)
+{
+#ifdef HAVE_KIS_RSM
+	int ret = libusb_bulk_transfer(client->handle, endpoint, data, length, transferred, timeout);
+	if (ret < 0) {
+		libusb_clear_halt(client->handle, endpoint);
+	}
+	return ret;
+#else
+	return irecv_usb_bulk_transfer(client, endpoint, data, length, transferred, timeout);
+#endif
+}
+
 static irecv_error_t irecv_kis_request(irecv_client_t client, KIS_req_header *req, size_t reqSize, KIS_req_header *rpl, size_t *rplSize)
 {
 	int endpoint = 0;
@@ -1082,7 +1135,7 @@ static irecv_error_t irecv_kis_request(irecv_client_t client, KIS_req_header *re
 	}
 
 	int sent = 0;
-	irecv_error_t err = irecv_usb_bulk_transfer(client, endpoint, (unsigned char *) req, reqSize, &sent, USB_TIMEOUT);
+	irecv_error_t err = irecv_kis_bulk_transfer(client, endpoint, (unsigned char *) req, reqSize, &sent, USB_TIMEOUT);
 	if (err != IRECV_E_SUCCESS) {
 		debug("[send] irecv_usb_bulk_transfer failed, error %d\n", err);
 		return err;
@@ -1094,7 +1147,7 @@ static irecv_error_t irecv_kis_request(irecv_client_t client, KIS_req_header *re
 	}
 
 	int rcvd = 0;
-	err = irecv_usb_bulk_transfer(client, endpoint | 0x80, (unsigned char *) rpl, *rplSize, &rcvd, USB_TIMEOUT);
+	err = irecv_kis_bulk_transfer(client, endpoint | 0x80, (unsigned char *) rpl, *rplSize, &rcvd, USB_TIMEOUT);
 	if (err != IRECV_E_SUCCESS) {
 		debug("[rcv] irecv_usb_bulk_transfer failed, error %d\n", err);
 		return err;
@@ -1165,6 +1218,429 @@ static int irecv_kis_read_string(KIS_device_info *di, size_t off, char *buf, siz
 }
 #endif
 
+#ifdef HAVE_KIS_RSM
+static void rsm_put32(unsigned char *p, uint32_t v)
+{
+	p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF; p[2] = (v >> 16) & 0xFF; p[3] = (v >> 24) & 0xFF;
+}
+
+static uint32_t rsm_get32(const unsigned char *p)
+{
+	return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* One KIS request on the RSM portal. reply receives the reply payload (after the header),
+ * *reply_size is its capacity on entry and the payload size on return. */
+static irecv_error_t rsm_kis(irecv_client_t client, uint16_t index, const uint32_t *args, size_t argc,
+		const unsigned char *payload, size_t payload_size, size_t rpl_words,
+		unsigned char *reply, size_t *reply_size, uint8_t *reply_index)
+{
+	size_t req_size = sizeof(KIS_req_header) + 4 * argc + payload_size;
+	unsigned char *req = malloc(req_size);
+	size_t rpl_size = sizeof(KIS_req_header) + *reply_size + 64;
+	unsigned char *rpl = malloc(rpl_size);
+	if (!req || !rpl) {
+		free(req);
+		free(rpl);
+		return IRECV_E_OUT_OF_MEMORY;
+	}
+	irecv_error_t err = irecv_kis_request_init((KIS_req_header *)req, KIS_PORTAL_RSM, index, argc, payload_size, rpl_words);
+	if (err == IRECV_E_SUCCESS) {
+		size_t i;
+		for (i = 0; i < argc; i++) {
+			rsm_put32(req + sizeof(KIS_req_header) + 4 * i, args[i]);
+		}
+		if (payload_size) {
+			memcpy(req + sizeof(KIS_req_header) + 4 * argc, payload, payload_size);
+		}
+		err = irecv_kis_request(client, (KIS_req_header *)req, req_size, (KIS_req_header *)rpl, &rpl_size);
+	}
+	if (err == IRECV_E_SUCCESS) {
+		if (rpl_size < sizeof(KIS_req_header)) {
+			err = IRECV_E_USB_UPLOAD;
+		} else {
+			size_t n = rpl_size - sizeof(KIS_req_header);
+			if (n > *reply_size) {
+				n = *reply_size;
+			}
+			memcpy(reply, rpl + sizeof(KIS_req_header), n);
+			*reply_size = n;
+			if (reply_index) {
+				*reply_index = ((KIS_req_header *)rpl)->indexLo;
+			}
+		}
+	}
+	free(req);
+	free(rpl);
+	return err;
+}
+
+static irecv_error_t rsm_mem_write(irecv_client_t client, uint64_t address, const unsigned char *data, uint32_t size)
+{
+	uint32_t args[3] = { (uint32_t)address, (uint32_t)(address >> 32), size };
+	unsigned char reply[8];
+	size_t reply_size = sizeof(reply);
+	irecv_error_t err = rsm_kis(client, KIS_INDEX_UPLOAD, args, 3, data, size, 0, reply, &reply_size, NULL);
+	if (err != IRECV_E_SUCCESS) {
+		return err;
+	}
+	if (reply_size < 8 || rsm_get32(reply + 4) != 0) {
+		debug("KIS RSM: memory write to 0x%" PRIx64 " failed, status 0x%x\n", address, reply_size < 8 ? 0 : rsm_get32(reply + 4));
+		return IRECV_E_USB_UPLOAD;
+	}
+	return IRECV_E_SUCCESS;
+}
+
+static irecv_error_t rsm_mem_read(irecv_client_t client, uint64_t address, uint32_t size, unsigned char *out)
+{
+	uint32_t args[2] = { (uint32_t)address, (uint32_t)(address >> 32) };
+	unsigned char payload[4];
+	rsm_put32(payload, size);
+	size_t reply_size = size + 8;
+	unsigned char *reply = malloc(reply_size);
+	if (!reply) {
+		return IRECV_E_OUT_OF_MEMORY;
+	}
+	irecv_error_t err = rsm_kis(client, KIS_INDEX_UPLOAD, args, 2, payload, sizeof(payload), 0, reply, &reply_size, NULL);
+	if (err == IRECV_E_SUCCESS && (reply_size < size + 8 || rsm_get32(reply + size + 4) != 0)) {
+		debug("KIS RSM: memory read at 0x%" PRIx64 " failed (%zu bytes)\n", address, reply_size);
+		err = IRECV_E_USB_UPLOAD;
+	}
+	if (err == IRECV_E_SUCCESS) {
+		memcpy(out, reply, size);
+	}
+	free(reply);
+	return err;
+}
+
+static irecv_error_t rsm_doorbell_write(irecv_client_t client, int doorbell, uint32_t value)
+{
+	unsigned char reply[8];
+	size_t reply_size = sizeof(reply);
+	return rsm_kis(client, (uint16_t)(KIS_INDEX_GET_INFO + doorbell), &value, 1, NULL, 0, 1, reply, &reply_size, NULL);
+}
+
+/* Reads the 256 doorbells. *available is 0 while the device has none to report (between the
+ * boot command and the RSM channel setup). */
+static irecv_error_t rsm_read_doorbells(irecv_client_t client, uint32_t bells[256], int *available)
+{
+	unsigned char reply[1024 + 8];
+	size_t reply_size = sizeof(reply);
+	uint8_t index = 0;
+	irecv_error_t err = rsm_kis(client, KIS_INDEX_GET_INFO, NULL, 0, NULL, 0, 256, reply, &reply_size, &index);
+	if (err != IRECV_E_SUCCESS) {
+		return err;
+	}
+	*available = (index == 0 && reply_size >= 1024);
+	int i;
+	for (i = 0; i < 256; i++) {
+		bells[i] = *available ? rsm_get32(reply + 4 * i) : 0;
+	}
+	return IRECV_E_SUCCESS;
+}
+
+static int rsm_find_channel(const uint32_t *bells, int type)
+{
+	if (bells[0] != RSM_MAGIC) {
+		return -1;
+	}
+	int ch;
+	for (ch = 0; ch < 16; ch++) {
+		if ((bells[RSM_DB_CHAN_DESC + ch] >> 24) == (uint32_t)type
+		    && (bells[RSM_DB_H2D_BASE + 2 * ch] || bells[RSM_DB_H2D_BASE + 2 * ch + 1])
+		    && (bells[RSM_DB_D2H_BASE + 2 * ch] || bells[RSM_DB_D2H_BASE + 2 * ch + 1])) {
+			return ch;
+		}
+	}
+	return -1;
+}
+
+static int rsm_channel_alive(irecv_client_t client, const uint32_t *bells)
+{
+	return bells[0] == RSM_MAGIC && bells[RSM_DB_CHAN_DESC + client->rsm_ch] == client->rsm_desc;
+}
+
+static uint32_t rsm_host_doorbell(irecv_client_t client)
+{
+	return (((client->rsm_dr >> 12) & 0xFF) << 24) | ((client->rsm_hw / 4) & 0xFFFFF);
+}
+
+/* The device reports how far it has read the H2D ring (4 KiB pages); keep the host at least
+ * RSM_RING_MARGIN behind it so a 1 MiB ring cannot overrun during large uploads. */
+static irecv_error_t rsm_wait_space(irecv_client_t client, uint32_t need)
+{
+	int polls = 0;
+	while (1) {
+		uint32_t used = (client->rsm_hw + RSM_RING_SIZE - client->rsm_drp) % RSM_RING_SIZE;
+		if (used + need + RSM_RING_MARGIN <= RSM_RING_SIZE) {
+			return IRECV_E_SUCCESS;
+		}
+		if (polls++ > 20000) {
+			debug("KIS RSM: device stopped reading the ring (offset 0x%x, device 0x%x)\n", client->rsm_hw, client->rsm_drp);
+			return IRECV_E_TIMEOUT;
+		}
+		uint32_t bells[256];
+		int available = 0;
+		irecv_error_t err = rsm_read_doorbells(client, bells, &available);
+		if (err != IRECV_E_SUCCESS) {
+			return err;
+		}
+		if (!available || !rsm_channel_alive(client, bells)) {
+			return IRECV_E_NO_DEVICE;
+		}
+		client->rsm_drp = (bells[RSM_DB_DEVICE_WP + client->rsm_ch] >> 24) * 0x1000;
+		if (polls > 1) {
+			usleep(500);
+		}
+	}
+}
+
+/* Writes one ring entry (header and payload, contiguous even across the ring end, as macOS
+ * does) and rings the host doorbell. */
+static irecv_error_t rsm_submit(irecv_client_t client, const unsigned char *entry, uint32_t size)
+{
+	irecv_error_t err = rsm_wait_space(client, size);
+	if (err != IRECV_E_SUCCESS) {
+		return err;
+	}
+	err = rsm_mem_write(client, client->rsm_h2d + client->rsm_hw, entry, size);
+	if (err != IRECV_E_SUCCESS) {
+		return err;
+	}
+	client->rsm_hw = (client->rsm_hw + size) % RSM_RING_SIZE;
+	return rsm_doorbell_write(client, RSM_DB_HOST_WP + client->rsm_ch, rsm_host_doorbell(client));
+}
+
+/* Waits for the next completion record: control OUT [1, status], control IN [length, data
+ * (padded to 4), 1, status]. */
+static irecv_error_t rsm_wait_completion(irecv_client_t client, int in, unsigned char *data, uint16_t capacity,
+		int *actual, uint32_t *status, unsigned int timeout_ms)
+{
+	unsigned int waited_us = 0;
+	if (timeout_ms == 0 || timeout_ms > 60000) {
+		timeout_ms = 60000;
+	}
+	while (1) {
+		uint32_t bells[256];
+		int available = 0;
+		irecv_error_t err = rsm_read_doorbells(client, bells, &available);
+		if (err != IRECV_E_SUCCESS) {
+			return err;
+		}
+		if (!available || !rsm_channel_alive(client, bells)) {
+			debug("KIS RSM: channel %d closed\n", client->rsm_ch);
+			return IRECV_E_NO_DEVICE;
+		}
+		uint32_t device = bells[RSM_DB_DEVICE_WP + client->rsm_ch];
+		client->rsm_drp = (device >> 24) * 0x1000;
+		uint32_t wp = (device & 0xFFFFF) * 4 % RSM_RING_SIZE;
+		uint32_t avail = (wp + RSM_RING_SIZE - client->rsm_dr) % RSM_RING_SIZE;
+		if (avail >= 8) {
+			uint32_t need = 8;
+			unsigned char head[4];
+			if (in) {
+				err = rsm_mem_read(client, client->rsm_d2h + client->rsm_dr, 4, head);
+				if (err != IRECV_E_SUCCESS) {
+					return err;
+				}
+				need = 4 + ((rsm_get32(head) + 3) & ~3u) + 8;
+			}
+			if (avail >= need) {
+				unsigned char *record = malloc(need);
+				if (!record) {
+					return IRECV_E_OUT_OF_MEMORY;
+				}
+				err = rsm_mem_read(client, client->rsm_d2h + client->rsm_dr, need, record);
+				if (err == IRECV_E_SUCCESS) {
+					client->rsm_dr = (client->rsm_dr + need) % RSM_RING_SIZE;
+					*status = rsm_get32(record + need - 4);
+					if (in) {
+						uint32_t len = rsm_get32(record);
+						if (len > capacity) {
+							len = capacity;
+						}
+						if (data && len) {
+							memcpy(data, record + 4, len);
+						}
+						*actual = (int)len;
+					} else {
+						*actual = 0;
+					}
+				}
+				free(record);
+				return err;
+			}
+		}
+		if (waited_us >= timeout_ms * 1000u) {
+			debug("KIS RSM: no completion within %u ms\n", timeout_ms);
+			return IRECV_E_TIMEOUT;
+		}
+		usleep(500);
+		waited_us += 1000; /* the doorbell read takes about as long as the sleep */
+	}
+}
+
+/* Control transfer through the RSM channel. Returns the number of bytes transferred or a
+ * negative libusb error, like libusb_control_transfer. */
+static int irecv_rsm_control_transfer(irecv_client_t client, uint8_t bm_request_type, uint8_t b_request,
+		uint16_t w_value, uint16_t w_index, unsigned char *data, uint16_t w_length, unsigned int timeout)
+{
+	if (bm_request_type == 0x21 && b_request == 1 && w_length == 0) {
+		/* idevicerestore finishes some Recovery uploads with an empty DFU_DNLOAD; macOS never
+		 * sends it over RSM, and after "go" the channel is already closing. */
+		debug("KIS RSM: skipping empty DFU_DNLOAD\n");
+		return 0;
+	}
+	int out_data = !(bm_request_type & 0x80) && w_length > 0 && data;
+	uint32_t size = 12 + (out_data ? 4 + ((w_length + 3) & ~3u) : 0);
+	unsigned char *entry = calloc(1, size);
+	if (!entry) {
+		return LIBUSB_ERROR_NO_MEM;
+	}
+	rsm_put32(entry, 8);
+	entry[4] = bm_request_type;
+	entry[5] = b_request;
+	entry[6] = w_value & 0xFF;
+	entry[7] = w_value >> 8;
+	entry[8] = w_index & 0xFF;
+	entry[9] = w_index >> 8;
+	entry[10] = w_length & 0xFF;
+	entry[11] = w_length >> 8;
+	if (out_data) {
+		rsm_put32(entry + 12, w_length);
+		memcpy(entry + 16, data, w_length);
+	}
+	irecv_error_t err = rsm_submit(client, entry, size);
+	free(entry);
+	if (err != IRECV_E_SUCCESS) {
+		return (err == IRECV_E_NO_DEVICE) ? LIBUSB_ERROR_NO_DEVICE : LIBUSB_ERROR_IO;
+	}
+	int actual = 0;
+	uint32_t status = 0;
+	err = rsm_wait_completion(client, bm_request_type & 0x80, data, w_length, &actual, &status, timeout);
+	if (err == IRECV_E_TIMEOUT) {
+		return LIBUSB_ERROR_TIMEOUT;
+	}
+	if (err != IRECV_E_SUCCESS) {
+		return (err == IRECV_E_NO_DEVICE) ? LIBUSB_ERROR_NO_DEVICE : LIBUSB_ERROR_IO;
+	}
+	if (status != 0) {
+		return LIBUSB_ERROR_PIPE;
+	}
+	return (bm_request_type & 0x80) ? actual : (int)w_length;
+}
+
+/* Bulk OUT through the RSM channel, one ring entry per 32 KB (as macOS). Bulk IN is not used
+ * over RSM by macOS and is not supported. */
+static int irecv_rsm_bulk_transfer(irecv_client_t client, unsigned char endpoint, unsigned char *data, int length,
+		int *transferred, unsigned int timeout)
+{
+	*transferred = 0;
+	if (endpoint & 0x80) {
+		return LIBUSB_ERROR_NOT_SUPPORTED;
+	}
+	unsigned char *entry = malloc(4 + RSM_MAX_ENTRY);
+	if (!entry) {
+		return LIBUSB_ERROR_NO_MEM;
+	}
+	int done = 0;
+	do {
+		uint32_t chunk = (uint32_t)(length - done);
+		if (chunk > RSM_MAX_ENTRY) {
+			chunk = RSM_MAX_ENTRY;
+		}
+		uint32_t size = 4 + ((chunk + 3) & ~3u);
+		rsm_put32(entry, ((uint32_t)(endpoint & 0x0F) << 24) | chunk);
+		memset(entry + 4, 0, size - 4);
+		if (chunk) {
+			memcpy(entry + 4, data + done, chunk);
+		}
+		irecv_error_t err = rsm_submit(client, entry, size);
+		if (err != IRECV_E_SUCCESS) {
+			free(entry);
+			return (err == IRECV_E_NO_DEVICE) ? LIBUSB_ERROR_NO_DEVICE : LIBUSB_ERROR_IO;
+		}
+		done += (int)chunk;
+		*transferred = done;
+	} while (done < length);
+	free(entry);
+	return 0;
+}
+
+/* Turns an open KIS client into a Recovery client over the device's RSM Recovery channel. */
+static irecv_error_t irecv_rsm_open(irecv_client_t client, const uint32_t *bells)
+{
+	int ch = rsm_find_channel(bells, RSM_CHANNEL_RECOVERY);
+	if (ch < 0) {
+		debug("KIS RSM: no Recovery channel offered (doorbell 0 = 0x%08x)\n", bells[0]);
+		client->rsm_waiting = 1;
+		return IRECV_E_UNABLE_TO_CONNECT;
+	}
+	/* iBSS answers memory accesses with status 0x200 until the RSM portal is enabled */
+	irecv_error_t err = irecv_kis_config_write32(client, KIS_PORTAL_CONFIG, KIS_INDEX_PORTAL_ENABLE, KIS_PORTAL_ENABLE_RSM);
+	if (err != IRECV_E_SUCCESS) {
+		debug("KIS RSM: portal enable failed, error %d\n", err);
+		return err;
+	}
+	client->rsm_ch = ch;
+	client->rsm_desc = bells[RSM_DB_CHAN_DESC + ch];
+	client->rsm_h2d = bells[RSM_DB_H2D_BASE + 2 * ch] | ((uint64_t)bells[RSM_DB_H2D_BASE + 2 * ch + 1] << 32);
+	client->rsm_d2h = bells[RSM_DB_D2H_BASE + 2 * ch] | ((uint64_t)bells[RSM_DB_D2H_BASE + 2 * ch + 1] << 32);
+	/* An earlier host may have used the channel: continue after its entries, skip old completions */
+	uint32_t host = bells[RSM_DB_HOST_WP + ch];
+	uint32_t device = bells[RSM_DB_DEVICE_WP + ch];
+	client->rsm_hw = (host & 0xFFFFF) * 4 % RSM_RING_SIZE;
+	client->rsm_dr = (device & 0xFFFFF) * 4 % RSM_RING_SIZE;
+	client->rsm_drp = (device >> 24) * 0x1000;
+	client->rsm = 1;
+	client->rsm_waiting = 0;
+	if (host == 0) {
+		unsigned char attach[4];
+		rsm_put32(attach, 0x80000000); /* class 0x80, length 0 */
+		err = rsm_submit(client, attach, sizeof(attach));
+		if (err != IRECV_E_SUCCESS) {
+			debug("KIS RSM: attach failed, error %d\n", err);
+			client->rsm = 0;
+			return err;
+		}
+		usleep(20000);
+	}
+
+	unsigned char desc[18];
+	memset(desc, 0, sizeof(desc));
+	int n = irecv_rsm_control_transfer(client, 0x80, 0x06, 0x0100, 0, desc, sizeof(desc), USB_TIMEOUT);
+	if (n < (int)sizeof(desc)) {
+		debug("KIS RSM: no device descriptor on channel %d (%d)\n", ch, n);
+		client->rsm = 0;
+		return IRECV_E_UNABLE_TO_CONNECT;
+	}
+	unsigned int product = desc[10] | (desc[11] << 8);
+	uint8_t iSerial = desc[16];
+	if (host == 0 && irecv_rsm_control_transfer(client, 0x00, 0x09, 1, 0, NULL, 0, USB_TIMEOUT) < 0) {
+		/* once per channel, after enumeration, like macOS */
+		debug("KIS RSM: SET_CONFIGURATION failed\n");
+	}
+	client->isKIS = 0;
+	client->mode = product;
+
+	char serial[256];
+	memset(serial, 0, sizeof(serial));
+	if (irecv_get_string_descriptor_ascii(client, iSerial, (unsigned char*)serial, sizeof(serial) - 1) <= 0) {
+		debug("KIS RSM: no serial number string on channel %d\n", ch);
+		client->rsm = 0;
+		return IRECV_E_UNABLE_TO_CONNECT;
+	}
+	irecv_load_device_info_from_iboot_string(client, serial);
+	free(client->device_info.ap_nonce);
+	free(client->device_info.sep_nonce);
+	irecv_copy_nonce_with_tag(client, "NONC", &client->device_info.ap_nonce, &client->device_info.ap_nonce_size);
+	irecv_copy_nonce_with_tag(client, "SNON", &client->device_info.sep_nonce, &client->device_info.sep_nonce_size);
+	debug("KIS RSM: Recovery device %04x on channel %d (H2D 0x%" PRIx64 ", D2H 0x%" PRIx64 "%s)\n",
+	      product, ch, client->rsm_h2d, client->rsm_d2h, host == 0 ? ", attached" : ", resumed");
+	return IRECV_E_SUCCESS;
+}
+#endif
+
 static irecv_error_t irecv_kis_init(irecv_client_t client)
 {
 #ifndef _WIN32
@@ -1219,6 +1695,22 @@ static irecv_error_t irecv_kis_load_device_info(irecv_client_t client)
 		debug("Failed to send KIS request, error %d\n", err);
 		return err;
 	}
+
+#ifdef HAVE_KIS_RSM
+	if (rcvSize < sizeof(KIS_req_header) + 0x40 || di.hdr.indexLo != 0) {
+		/* A booted image (iBSS/iBEC) has no device info until it sets up RSM channels */
+		debug("KIS: no device info, booted image without RSM channels yet\n");
+		client->rsm_waiting = 1;
+		return IRECV_E_UNABLE_TO_CONNECT;
+	}
+	if (di.tag == RSM_MAGIC) {
+		/* A booted image with RSM channels: Recovery runs over the Recovery channel */
+		uint32_t bells[256];
+		memset(bells, 0, sizeof(bells));
+		memcpy(bells, di.deviceInfo, sizeof(di.deviceInfo));
+		return irecv_rsm_open(client, bells);
+	}
+#endif
 
 	/* The ROM loads uploaded images at rambase. It is 0 on some devices and not on
 	 * others (0x10000000000 on a MacBook Neo); macOS uploads to rambase + offset. */
@@ -1479,6 +1971,11 @@ int irecv_usb_control_transfer(irecv_client_t client, uint8_t bm_request_type, u
 #ifdef HAVE_IOKIT
 	return iokit_usb_control_transfer(client, bm_request_type, b_request, w_value, w_index, data, w_length, timeout);
 #else
+#ifdef HAVE_KIS_RSM
+	if (client->rsm) {
+		return irecv_rsm_control_transfer(client, bm_request_type, b_request, w_value, w_index, data, w_length, timeout);
+	}
+#endif
 	return libusb_control_transfer(client->handle, bm_request_type, b_request, w_value, w_index, data, w_length, timeout);
 #endif
 #else
@@ -1836,6 +2333,11 @@ int irecv_usb_bulk_transfer(irecv_client_t client,
 #ifdef HAVE_IOKIT
 	return iokit_usb_bulk_transfer(client, endpoint, data, length, transferred, timeout);
 #else
+#ifdef HAVE_KIS_RSM
+	if (client->rsm) {
+		return irecv_rsm_bulk_transfer(client, endpoint, data, length, transferred, timeout);
+	}
+#endif
 	ret = libusb_bulk_transfer(client->handle, endpoint, data, length, transferred, timeout);
 	if (ret < 0) {
 		libusb_clear_halt(client->handle, endpoint);
@@ -2387,6 +2889,12 @@ irecv_error_t irecv_usb_set_interface(irecv_client_t client, int usb_interface, 
 		return IRECV_E_NO_DEVICE;
 
 	debug("Setting to interface %d:%d\n", usb_interface, usb_alt_interface);
+#ifdef HAVE_KIS_RSM
+	if (client->rsm) {
+		/* the tunnelled Recovery device has no USB interfaces of its own; the KIS interface stays claimed */
+		return IRECV_E_SUCCESS;
+	}
+#endif
 #ifndef _WIN32
 #ifdef HAVE_IOKIT
 	if (iokit_usb_set_interface(client, usb_interface, usb_alt_interface) < 0) {
@@ -2424,6 +2932,12 @@ irecv_error_t irecv_reset(irecv_client_t client)
 #else
 	if (check_context(client) != IRECV_E_SUCCESS)
 		return IRECV_E_NO_DEVICE;
+
+	if (client->rsm) {
+		/* resetting the KIS device would end the whole session, not just Recovery */
+		debug("KIS RSM: not resetting the KIS device\n");
+		return IRECV_E_SUCCESS;
+	}
 
 #ifndef _WIN32
 #ifdef HAVE_IOKIT
@@ -2562,6 +3076,7 @@ struct irecv_usb_device_info {
 	enum irecv_mode mode;
 	uint32_t location;
 	int alive;
+	int kis; /* KIS device: its mode can change without USB re-enumeration (RSM channels) */
 };
 
 #ifdef _WIN32
@@ -2638,6 +3153,40 @@ static int _irecv_is_recovery_device(void *device)
 			return 0;
 	}
 	return 1;
+}
+
+/* Adds a device to the device list and notifies the listeners. A KIS device without a Recovery
+ * channel (mode KIS_PRODUCT_ID) is only listed, so the RSM watcher can follow it. */
+static void _irecv_device_list_add(uint32_t location, unsigned int mode, int kis, const char *serial_str)
+{
+	struct irecv_client_private client_loc;
+	memset(&client_loc, 0, sizeof(client_loc));
+	client_loc.mode = mode;
+	irecv_load_device_info_from_iboot_string(&client_loc, serial_str);
+
+	struct irecv_usb_device_info *usb_dev_info = (struct irecv_usb_device_info*)malloc(sizeof(struct irecv_usb_device_info));
+	memcpy(&(usb_dev_info->device_info), &(client_loc.device_info), sizeof(struct irecv_device_info));
+	usb_dev_info->location = location;
+	usb_dev_info->alive = 1;
+	usb_dev_info->mode = client_loc.mode;
+	usb_dev_info->kis = kis;
+
+	collection_add(&devices, usb_dev_info);
+
+	if (kis && mode == KIS_PRODUCT_ID) {
+		return;
+	}
+
+	irecv_device_event_t dev_event;
+	dev_event.type = IRECV_DEVICE_ADD;
+	dev_event.mode = client_loc.mode;
+	dev_event.device_info = &(usb_dev_info->device_info);
+
+	mutex_lock(&listener_mutex);
+	FOREACH(struct irecv_device_event_context* context, &listeners) {
+		context->callback(&dev_event, context->user_data);
+	} ENDFOREACH
+	mutex_unlock(&listener_mutex);
 }
 
 static void* _irecv_handle_device_add(void *userdata)
@@ -2845,6 +3394,14 @@ static void* _irecv_handle_device_add(void *userdata)
 
 		error = irecv_kis_load_device_info(client);
 		if (error != IRECV_E_SUCCESS) {
+#ifdef HAVE_KIS_RSM
+			if (client->rsm_waiting) {
+				/* booted image without a Recovery channel yet; the RSM watcher follows it */
+				irecv_close(client);
+				_irecv_device_list_add(location, KIS_PRODUCT_ID, 1, "");
+				return NULL;
+			}
+#endif
 			debug("irecv_kis_load_device_info failed, error %d\n", error);
 			irecv_close(client);
 			return NULL;
@@ -2858,42 +3415,24 @@ static void* _irecv_handle_device_add(void *userdata)
 		irecv_close(client);
 	}
 
-	client_loc.mode = product_id;
-	irecv_load_device_info_from_iboot_string(&client_loc, serial_str);
-
-	struct irecv_usb_device_info *usb_dev_info = (struct irecv_usb_device_info*)malloc(sizeof(struct irecv_usb_device_info));
-	memcpy(&(usb_dev_info->device_info), &(client_loc.device_info), sizeof(struct irecv_device_info));
-	usb_dev_info->location = location;
-	usb_dev_info->alive = 1;
-	usb_dev_info->mode = client_loc.mode;
-
-	collection_add(&devices, usb_dev_info);
-
-	irecv_device_event_t dev_event;
-	dev_event.type = IRECV_DEVICE_ADD;
-	dev_event.mode = client_loc.mode;
-	dev_event.device_info = &(usb_dev_info->device_info);
-
-	mutex_lock(&listener_mutex);
-	FOREACH(struct irecv_device_event_context* context, &listeners) {
-		context->callback(&dev_event, context->user_data);
-	} ENDFOREACH
-	mutex_unlock(&listener_mutex);
+	_irecv_device_list_add(location, product_id, client_loc.isKIS, serial_str);
 
 	return NULL;
 }
 
 static void _irecv_handle_device_remove(struct irecv_usb_device_info *devinfo)
 {
-	irecv_device_event_t dev_event;
-	dev_event.type = IRECV_DEVICE_REMOVE;
-	dev_event.mode = devinfo->mode;
-	dev_event.device_info = &(devinfo->device_info);
-	mutex_lock(&listener_mutex);
-	FOREACH(struct irecv_device_event_context* context, &listeners) {
-		context->callback(&dev_event, context->user_data);
-	} ENDFOREACH
-	mutex_unlock(&listener_mutex);
+	if (!(devinfo->kis && devinfo->mode == KIS_PRODUCT_ID)) {
+		irecv_device_event_t dev_event;
+		dev_event.type = IRECV_DEVICE_REMOVE;
+		dev_event.mode = devinfo->mode;
+		dev_event.device_info = &(devinfo->device_info);
+		mutex_lock(&listener_mutex);
+		FOREACH(struct irecv_device_event_context* context, &listeners) {
+			context->callback(&dev_event, context->user_data);
+		} ENDFOREACH
+		mutex_unlock(&listener_mutex);
+	}
 	free(devinfo->device_info.srnm);
 	devinfo->device_info.srnm = NULL;
 	free(devinfo->device_info.imei);
@@ -3005,6 +3544,119 @@ static int _irecv_usb_hotplug_cb(libusb_context *ctx, libusb_device *device, lib
 #endif /* HAVE_LIBUSB_HOTPLUG_API */
 #endif /* !HAVE_IOKIT */
 #endif /* !_WIN32 */
+
+#ifdef HAVE_KIS_RSM
+/* Mode a KIS device presents now: IRECV_K_DFU_MODE (boot ROM), the tunnelled Recovery mode while a
+ * Recovery channel is up (serial_str receives its serial string), KIS_PRODUCT_ID for a booted image
+ * without one, or 0 when the device cannot be checked (a client has it open). A Recovery channel
+ * that is already in use is left alone; *attached is set when a new channel was attached (a new
+ * Recovery session, e.g. iBEC after iBSS, even if the gap between the channels was missed). */
+static unsigned int _irecv_rsm_current_mode(libusb_device *device, unsigned int known_mode, int *attached,
+		char *serial_str, size_t serial_size)
+{
+	*attached = 0;
+	struct libusb_device_handle *handle = NULL;
+	if (libusb_open(device, &handle) != 0 || !handle) {
+		return 0;
+	}
+	if (libusb_claim_interface(handle, 0) != 0) {
+		libusb_close(handle);
+		return 0;
+	}
+	irecv_client_t client = (irecv_client_t)calloc(1, sizeof(struct irecv_client_private));
+	if (!client) {
+		libusb_release_interface(handle, 0);
+		libusb_close(handle);
+		return 0;
+	}
+	client->handle = handle;
+	client->mode = KIS_PRODUCT_ID;
+
+	unsigned int mode = 0;
+	uint32_t bells[256];
+	int available = 0;
+	if (rsm_read_doorbells(client, bells, &available) == IRECV_E_SUCCESS) {
+		if (!available) {
+			mode = KIS_PRODUCT_ID;
+		} else if (bells[0] == KIS_INFO_TAG_DFU) {
+			mode = IRECV_K_DFU_MODE;
+		} else if (rsm_find_channel(bells, RSM_CHANNEL_RECOVERY) >= 0) {
+			int ch = rsm_find_channel(bells, RSM_CHANNEL_RECOVERY);
+			int in_use = bells[RSM_DB_HOST_WP + ch] != 0;
+			if (in_use && known_mode >= IRECV_K_RECOVERY_MODE_1 && known_mode <= IRECV_K_RECOVERY_MODE_4) {
+				mode = known_mode;
+			} else if (irecv_rsm_open(client, bells) == IRECV_E_SUCCESS) {
+				mode = client->mode;
+				*attached = !in_use;
+				if (client->device_info.serial_string) {
+					strncpy(serial_str, client->device_info.serial_string, serial_size - 1);
+				}
+			} else {
+				mode = KIS_PRODUCT_ID;
+			}
+		} else {
+			mode = KIS_PRODUCT_ID;
+		}
+	}
+	/* releases interface 0 and closes the handle */
+	irecv_close(client);
+	return mode;
+}
+
+/* A KIS device does not re-enumerate when iBSS or iBEC starts: Recovery appears and disappears as
+ * an RSM channel in its doorbells. Report those changes as the device add/remove events a USB
+ * re-enumeration would give. */
+static void _irecv_rsm_poll(void)
+{
+	struct { uint32_t location; unsigned int mode; } kis[16];
+	int n = 0;
+	FOREACH(struct irecv_usb_device_info *devinfo, &devices) {
+		if (devinfo->kis && n < 16) {
+			kis[n].location = devinfo->location;
+			kis[n].mode = devinfo->mode;
+			n++;
+		}
+	} ENDFOREACH
+	if (n == 0) {
+		return;
+	}
+	libusb_device **devs = NULL;
+	ssize_t cnt = libusb_get_device_list(irecv_hotplug_ctx, &devs);
+	int i;
+	for (i = 0; i < n; i++) {
+		libusb_device *device = NULL;
+		ssize_t j;
+		for (j = 0; j < cnt; j++) {
+			uint32_t location = (libusb_get_bus_number(devs[j]) << 16) | libusb_get_device_address(devs[j]);
+			if (location == kis[i].location) {
+				device = devs[j];
+				break;
+			}
+		}
+		if (!device) {
+			continue;
+		}
+		char serial_str[256];
+		memset(serial_str, 0, sizeof(serial_str));
+		int attached = 0;
+		unsigned int mode = _irecv_rsm_current_mode(device, kis[i].mode, &attached, serial_str, sizeof(serial_str));
+		if (mode == 0 || mode == IRECV_K_DFU_MODE || (mode == kis[i].mode && !attached)) {
+			continue;
+		}
+		debug("KIS RSM: device at 0x%x changed from mode 0x%x to 0x%x\n", kis[i].location, kis[i].mode, mode);
+		FOREACH(struct irecv_usb_device_info *devinfo, &devices) {
+			if (devinfo->location == kis[i].location) {
+				_irecv_handle_device_remove(devinfo);
+				break;
+			}
+		} ENDFOREACH
+		_irecv_device_list_add(kis[i].location, mode, 1, serial_str);
+	}
+	if (devs) {
+		libusb_free_device_list(devs, 1);
+	}
+}
+#endif
 
 struct _irecv_event_handler_info {
 	cond_t startup_cond;
@@ -3213,6 +3865,13 @@ static void *_irecv_event_handler(void* data)
 		struct timeval tv;
 		tv.tv_sec = tv.tv_usec = 0;
 		libusb_handle_events_timeout(irecv_hotplug_ctx, &tv);
+#ifdef HAVE_KIS_RSM
+		static int rsm_ticks = 0;
+		if (++rsm_ticks >= 5) {
+			rsm_ticks = 0;
+			_irecv_rsm_poll();
+		}
+#endif
 
 		mutex_lock(&listener_mutex);
 		if (collection_count(&listeners) == 0) {
@@ -3271,6 +3930,9 @@ static void *_irecv_event_handler(void* data)
 		} ENDFOREACH
 
 		libusb_free_device_list(devs, 1);
+#ifdef HAVE_KIS_RSM
+		_irecv_rsm_poll();
+#endif
 
 		mutex_lock(&listener_mutex);
 		if (collection_count(&listeners) == 0) {
