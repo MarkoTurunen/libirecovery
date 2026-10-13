@@ -31,6 +31,7 @@
 #include <ctype.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include <libimobiledevice-glue/collection.h>
 #include <libimobiledevice-glue/thread.h>
@@ -130,6 +131,7 @@ struct irecv_client_private {
 	uint32_t rsm_hw;   /* host write offset in the H2D ring (bytes) */
 	uint32_t rsm_dr;   /* host read offset in the D2H ring (bytes) */
 	uint32_t rsm_drp;  /* device read offset in the H2D ring as last reported (4 KiB granularity) */
+	unsigned int kis_timeout; /* KIS request timeout in ms, 0 = USB_TIMEOUT (the device watcher uses a short one) */
 	struct irecv_device_info device_info;
 #ifndef USE_DUMMY
 #ifndef _WIN32
@@ -1151,7 +1153,8 @@ static irecv_error_t irecv_kis_request(irecv_client_t client, KIS_req_header *re
 #ifdef HAVE_KIS_RSM
 	mutex_lock(&kis_request_mutex);
 #endif
-	irecv_error_t err = irecv_kis_bulk_transfer(client, endpoint, (unsigned char *) req, reqSize, &sent, USB_TIMEOUT);
+	unsigned int timeout = client->kis_timeout ? client->kis_timeout : USB_TIMEOUT;
+	irecv_error_t err = irecv_kis_bulk_transfer(client, endpoint, (unsigned char *) req, reqSize, &sent, timeout);
 	if (err != IRECV_E_SUCCESS) {
 		debug("[send] irecv_usb_bulk_transfer failed, error %d\n", err);
 	} else if ((size_t) sent != reqSize) {
@@ -1159,7 +1162,7 @@ static irecv_error_t irecv_kis_request(irecv_client_t client, KIS_req_header *re
 		err = IRECV_E_USB_UPLOAD;
 	} else {
 		int rcvd = 0;
-		err = irecv_kis_bulk_transfer(client, endpoint | 0x80, (unsigned char *) rpl, *rplSize, &rcvd, USB_TIMEOUT);
+		err = irecv_kis_bulk_transfer(client, endpoint | 0x80, (unsigned char *) rpl, *rplSize, &rcvd, timeout);
 		if (err != IRECV_E_SUCCESS) {
 			debug("[rcv] irecv_usb_bulk_transfer failed, error %d\n", err);
 		} else {
@@ -1289,7 +1292,14 @@ static irecv_error_t rsm_kis(irecv_client_t client, uint16_t index, const uint32
 	return err;
 }
 
-static irecv_error_t rsm_mem_write(irecv_client_t client, uint64_t address, const unsigned char *data, uint32_t size)
+/* KIS transfers that are a multiple of the 512-byte packet size end without a short packet, and the
+ * device takes the next request for part of the same one (MacBook Neo). The macOS host never sends or
+ * asks for one; a memory write (24 bytes overhead) or read reply (20 bytes) that would be one is done
+ * in two parts. */
+#define KIS_WRITE_OVERHEAD 24
+#define KIS_READ_OVERHEAD  20
+
+static irecv_error_t rsm_mem_write_once(irecv_client_t client, uint64_t address, const unsigned char *data, uint32_t size)
 {
 	uint32_t args[3] = { (uint32_t)address, (uint32_t)(address >> 32), size };
 	unsigned char reply[8];
@@ -1305,7 +1315,16 @@ static irecv_error_t rsm_mem_write(irecv_client_t client, uint64_t address, cons
 	return IRECV_E_SUCCESS;
 }
 
-static irecv_error_t rsm_mem_read(irecv_client_t client, uint64_t address, uint32_t size, unsigned char *out)
+static irecv_error_t rsm_mem_write(irecv_client_t client, uint64_t address, const unsigned char *data, uint32_t size)
+{
+	if ((KIS_WRITE_OVERHEAD + size) % 512 == 0 && size > 4) {
+		irecv_error_t err = rsm_mem_write_once(client, address, data, size - 4);
+		return err != IRECV_E_SUCCESS ? err : rsm_mem_write_once(client, address + size - 4, data + size - 4, 4);
+	}
+	return rsm_mem_write_once(client, address, data, size);
+}
+
+static irecv_error_t rsm_mem_read_once(irecv_client_t client, uint64_t address, uint32_t size, unsigned char *out)
 {
 	uint32_t args[2] = { (uint32_t)address, (uint32_t)(address >> 32) };
 	unsigned char payload[4];
@@ -1325,6 +1344,15 @@ static irecv_error_t rsm_mem_read(irecv_client_t client, uint64_t address, uint3
 	}
 	free(reply);
 	return err;
+}
+
+static irecv_error_t rsm_mem_read(irecv_client_t client, uint64_t address, uint32_t size, unsigned char *out)
+{
+	if ((KIS_READ_OVERHEAD + size) % 512 == 0 && size > 4) {
+		irecv_error_t err = rsm_mem_read_once(client, address, size - 4, out);
+		return err != IRECV_E_SUCCESS ? err : rsm_mem_read_once(client, address + size - 4, 4, out + size - 4);
+	}
+	return rsm_mem_read_once(client, address, size, out);
 }
 
 static irecv_error_t rsm_doorbell_write(irecv_client_t client, int doorbell, uint32_t value)
@@ -3607,9 +3635,10 @@ static int _irecv_usb_hotplug_cb(libusb_context *ctx, libusb_device *device, lib
  * that is already in use is left alone; *attached is set when a new channel was attached (a new
  * Recovery session, e.g. iBEC after iBSS, even if the gap between the channels was missed). */
 static unsigned int _irecv_rsm_current_mode(libusb_device *device, unsigned int known_mode, int *attached,
-		char *serial_str, size_t serial_size)
+		char *serial_str, size_t serial_size, int *failed)
 {
 	*attached = 0;
+	*failed = 0;
 	struct libusb_device_handle *handle = NULL;
 	int borrowed = 0;
 	if (libusb_open(device, &handle) != 0 || !handle || libusb_claim_interface(handle, 0) != 0) {
@@ -3646,11 +3675,14 @@ static unsigned int _irecv_rsm_current_mode(libusb_device *device, unsigned int 
 	}
 	client->handle = handle;
 	client->mode = KIS_PRODUCT_ID;
+	client->kis_timeout = 1000; /* a hung device must not hold up the event thread for long */
 
 	unsigned int mode = 0;
 	uint32_t bells[256];
 	int available = 0;
-	if (rsm_read_doorbells(client, bells, &available) == IRECV_E_SUCCESS) {
+	if (rsm_read_doorbells(client, bells, &available) != IRECV_E_SUCCESS) {
+		*failed = 1;
+	} else {
 		if (!available) {
 			mode = KIS_PRODUCT_ID;
 		} else if (bells[0] == KIS_INFO_TAG_DFU) {
@@ -3690,12 +3722,50 @@ static unsigned int _irecv_rsm_current_mode(libusb_device *device, unsigned int 
 /* A KIS device does not re-enumerate when iBSS or iBEC starts: Recovery appears and disappears as
  * an RSM channel in its doorbells. Report those changes as the device add/remove events a USB
  * re-enumeration would give. */
+/* KIS devices that did not answer the watcher are left alone for a while: a hung device (a MacBook Neo
+ * after a failed restore) would otherwise stall this event thread, which also serves other devices. */
+#define RSM_POLL_BACKOFF_MS 30000
+static struct { uint32_t location; uint64_t until_ms; } rsm_poll_backoff[16];
+
+static uint64_t rsm_now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int rsm_poll_backed_off(uint32_t location)
+{
+	int i;
+	for (i = 0; i < 16; i++) {
+		if (rsm_poll_backoff[i].location == location && rsm_poll_backoff[i].until_ms > rsm_now_ms()) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void rsm_poll_back_off(uint32_t location)
+{
+	int i, slot = 0;
+	for (i = 0; i < 16; i++) {
+		if (rsm_poll_backoff[i].location == location || rsm_poll_backoff[i].until_ms < rsm_poll_backoff[slot].until_ms) {
+			slot = i;
+			if (rsm_poll_backoff[i].location == location) {
+				break;
+			}
+		}
+	}
+	rsm_poll_backoff[slot].location = location;
+	rsm_poll_backoff[slot].until_ms = rsm_now_ms() + RSM_POLL_BACKOFF_MS;
+}
+
 static void _irecv_rsm_poll(void)
 {
 	struct { uint32_t location; unsigned int mode; } kis[16];
 	int n = 0;
 	FOREACH(struct irecv_usb_device_info *devinfo, &devices) {
-		if (devinfo->kis && n < 16) {
+		if (devinfo->kis && n < 16 && !rsm_poll_backed_off(devinfo->location)) {
 			kis[n].location = devinfo->location;
 			kis[n].mode = devinfo->mode;
 			n++;
@@ -3722,8 +3792,13 @@ static void _irecv_rsm_poll(void)
 		}
 		char serial_str[256];
 		memset(serial_str, 0, sizeof(serial_str));
-		int attached = 0;
-		unsigned int mode = _irecv_rsm_current_mode(device, kis[i].mode, &attached, serial_str, sizeof(serial_str));
+		int attached = 0, failed = 0;
+		unsigned int mode = _irecv_rsm_current_mode(device, kis[i].mode, &attached, serial_str, sizeof(serial_str), &failed);
+		if (failed) {
+			debug("KIS RSM: device at 0x%x does not answer; not polled for %d s\n", kis[i].location, RSM_POLL_BACKOFF_MS / 1000);
+			rsm_poll_back_off(kis[i].location);
+			continue;
+		}
 		if (mode == 0 || mode == IRECV_K_DFU_MODE || (mode == kis[i].mode && !attached)) {
 			continue;
 		}
@@ -4412,6 +4487,9 @@ static irecv_error_t irecv_kis_send_buffer(irecv_client_t client, unsigned char*
 		unsigned long toUpload = length;
 		if (toUpload > 0x4000)
 			toUpload = 0x4000;
+		/* keep the request off a multiple of 512 bytes (header and arguments are 24 bytes) */
+		if ((24 + toUpload) % 512 == 0 && toUpload > 4)
+			toUpload -= 4;
 
 #ifdef _WIN32
 		memcpy(chunk->data, buffer, toUpload);
