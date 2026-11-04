@@ -750,7 +750,18 @@ static THREAD_T th_event_handler = THREAD_T_NULL;
 struct collection listeners;
 static mutex_t listener_mutex;
 struct collection devices;
+/* Guards devices. With the libusb hotplug API every arriving device is handled in a thread of its own
+ * while the event thread removes devices that leave, so the list is changed from several threads. Lock
+ * order: device_mutex before listener_mutex. */
 static mutex_t device_mutex;
+#if !defined(_WIN32) && !defined(HAVE_IOKIT)
+/* Device add threads still running (guarded by device_mutex), and the locations of devices that left
+ * while one was running and were not listed yet, so their add thread does not list them afterwards. */
+static int add_threads_running = 0;
+#define LEFT_WHILE_ADDING_MAX 32
+static uint32_t left_while_adding[LEFT_WHILE_ADDING_MAX];
+static int left_while_adding_count = 0;
+#endif
 #ifdef HAVE_KIS_RSM
 /* A KIS request is a bulk OUT followed by its bulk IN reply. The RSM watcher may send requests on a
  * handle a client is using, so requests are serialized. */
@@ -3247,6 +3258,22 @@ static void _irecv_device_list_add(uint32_t location, unsigned int mode, int kis
 	client_loc.mode = mode;
 	irecv_load_device_info_from_iboot_string(&client_loc, serial_str);
 
+	mutex_lock(&device_mutex);
+#if !defined(_WIN32) && !defined(HAVE_IOKIT)
+	int i;
+	for (i = 0; i < left_while_adding_count; i++) {
+		if (left_while_adding[i] == location) {
+			left_while_adding[i] = left_while_adding[--left_while_adding_count];
+			mutex_unlock(&device_mutex);
+			debug("%s: device at 0x%x left before it was listed\n", __func__, location);
+			free(client_loc.device_info.srnm);
+			free(client_loc.device_info.imei);
+			free(client_loc.device_info.srtg);
+			free(client_loc.device_info.serial_string);
+			return;
+		}
+	}
+#endif
 	struct irecv_usb_device_info *usb_dev_info = (struct irecv_usb_device_info*)malloc(sizeof(struct irecv_usb_device_info));
 	memcpy(&(usb_dev_info->device_info), &(client_loc.device_info), sizeof(struct irecv_device_info));
 	usb_dev_info->location = location;
@@ -3255,6 +3282,7 @@ static void _irecv_device_list_add(uint32_t location, unsigned int mode, int kis
 	usb_dev_info->kis = kis;
 
 	collection_add(&devices, usb_dev_info);
+	mutex_unlock(&device_mutex);
 
 	if (kis && mode == KIS_PRODUCT_ID) {
 		return;
@@ -3431,6 +3459,7 @@ static void* _irecv_handle_device_add(void *userdata)
 		libusb_error = libusb_get_string_descriptor_ascii(usb_handle, devdesc.iSerialNumber, (unsigned char*)serial_str, sizeof(serial_str)-1);
 		if (libusb_error < 0) {
 			debug("%s: Failed to get string descriptor: %s\n", __func__, libusb_error_name(libusb_error));
+			libusb_close(usb_handle);
 			return 0;
 		}
 		libusb_close(usb_handle);
@@ -3598,6 +3627,19 @@ static void iokit_device_removed(void *refcon, io_iterator_t iterator)
 }
 #else /* !HAVE_IOKIT */
 #ifdef HAVE_LIBUSB_HOTPLUG_API
+static void* _irecv_handle_device_add_thread(void *userdata)
+{
+	libusb_device *device = (libusb_device*)userdata;
+	_irecv_handle_device_add(device);
+	libusb_unref_device(device);
+	mutex_lock(&device_mutex);
+	if (--add_threads_running == 0) {
+		left_while_adding_count = 0;
+	}
+	mutex_unlock(&device_mutex);
+	return NULL;
+}
+
 static int _irecv_usb_hotplug_cb(libusb_context *ctx, libusb_device *device, libusb_hotplug_event event, void *user_data)
 {
 	if (!_irecv_is_recovery_device(device)) {
@@ -3605,8 +3647,18 @@ static int _irecv_usb_hotplug_cb(libusb_context *ctx, libusb_device *device, lib
 	}
 	if (event == LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED) {
 		THREAD_T th_device;
-		if (thread_new(&th_device, _irecv_handle_device_add, device) != 0) {
+		/* The device is only valid during this callback: libusb frees it when it leaves, which can
+		 * happen while the add thread still opens it. The thread holds its own reference. */
+		libusb_ref_device(device);
+		mutex_lock(&device_mutex);
+		add_threads_running++;
+		mutex_unlock(&device_mutex);
+		if (thread_new(&th_device, _irecv_handle_device_add_thread, device) != 0) {
 			debug("%s: FATAL: failed to create thread to handle device add\n", __func__);
+			mutex_lock(&device_mutex);
+			add_threads_running--;
+			mutex_unlock(&device_mutex);
+			libusb_unref_device(device);
 			return 0;
 		}
 		thread_detach(th_device);
@@ -3614,12 +3666,19 @@ static int _irecv_usb_hotplug_cb(libusb_context *ctx, libusb_device *device, lib
 		uint8_t bus = libusb_get_bus_number(device);
 		uint8_t address = libusb_get_device_address(device);
 		uint32_t location = (bus << 16) | address;
+		int found = 0;
+		mutex_lock(&device_mutex);
 		FOREACH(struct irecv_usb_device_info *devinfo, &devices) {
 			if (devinfo->location == location) {
 				_irecv_handle_device_remove(devinfo);
+				found = 1;
 				break;
 			}
 		} ENDFOREACH
+		if (!found && add_threads_running > 0 && left_while_adding_count < LEFT_WHILE_ADDING_MAX) {
+			left_while_adding[left_while_adding_count++] = location;
+		}
+		mutex_unlock(&device_mutex);
 	}
 
 	return 0;
@@ -3764,6 +3823,7 @@ static void _irecv_rsm_poll(void)
 {
 	struct { uint32_t location; unsigned int mode; } kis[16];
 	int n = 0;
+	mutex_lock(&device_mutex);
 	FOREACH(struct irecv_usb_device_info *devinfo, &devices) {
 		if (devinfo->kis && n < 16 && !rsm_poll_backed_off(devinfo->location)) {
 			kis[n].location = devinfo->location;
@@ -3771,6 +3831,7 @@ static void _irecv_rsm_poll(void)
 			n++;
 		}
 	} ENDFOREACH
+	mutex_unlock(&device_mutex);
 	if (n == 0) {
 		return;
 	}
@@ -3803,12 +3864,14 @@ static void _irecv_rsm_poll(void)
 			continue;
 		}
 		debug("KIS RSM: device at 0x%x changed from mode 0x%x to 0x%x\n", kis[i].location, kis[i].mode, mode);
+		mutex_lock(&device_mutex);
 		FOREACH(struct irecv_usb_device_info *devinfo, &devices) {
 			if (devinfo->location == kis[i].location) {
 				_irecv_handle_device_remove(devinfo);
 				break;
 			}
 		} ENDFOREACH
+		mutex_unlock(&device_mutex);
 		_irecv_device_list_add(kis[i].location, mode, 1, serial_str);
 	}
 	if (devs) {
@@ -4148,7 +4211,10 @@ irecv_error_t irecv_device_event_subscribe(irecv_device_event_context_t *context
 		cond_destroy(&info.startup_cond);
 		mutex_destroy(&info.startup_mutex);
 	} else {
-		/* send DEVICE_ADD events to the new listener */
+		/* send DEVICE_ADD events to the new listener (device_mutex is taken before listener_mutex) */
+		mutex_unlock(&listener_mutex);
+		mutex_lock(&device_mutex);
+		mutex_lock(&listener_mutex);
 		FOREACH(struct irecv_usb_device_info *devinfo, &devices) {
 			if (devinfo && devinfo->alive) {
 				irecv_device_event_t ev;
@@ -4159,6 +4225,7 @@ irecv_error_t irecv_device_event_subscribe(irecv_device_event_context_t *context
 			}
 		} ENDFOREACH
 		mutex_unlock(&listener_mutex);
+		mutex_unlock(&device_mutex);
 	}
 
 	*context = _context;
@@ -4191,6 +4258,24 @@ irecv_error_t irecv_device_event_unsubscribe(irecv_device_event_context_t contex
 		thread_join(th_event_handler);
 		thread_free(th_event_handler);
 		th_event_handler = THREAD_T_NULL;
+#if !defined(_WIN32) && !defined(HAVE_IOKIT)
+		/* No add thread starts any more; the running ones still use devices and device_mutex. */
+		int waited_ms = 0;
+		mutex_lock(&device_mutex);
+		while (add_threads_running > 0 && waited_ms < 30000) {
+			mutex_unlock(&device_mutex);
+			usleep(10000);
+			waited_ms += 10;
+			mutex_lock(&device_mutex);
+		}
+		if (add_threads_running > 0) {
+			/* leave the list and the mutex to the stuck thread rather than free them under it */
+			mutex_unlock(&device_mutex);
+			debug("%s: %d device add thread(s) still running, not freeing the device list\n", __func__, add_threads_running);
+			goto free_context;
+		}
+		mutex_unlock(&device_mutex);
+#endif
 		mutex_lock(&device_mutex);
 		FOREACH(struct irecv_usb_device_info *devinfo, &devices) {
 			free(devinfo->device_info.srnm);
@@ -4214,6 +4299,9 @@ irecv_error_t irecv_device_event_unsubscribe(irecv_device_event_context_t contex
 #endif
 	}
 
+#if !defined(_WIN32) && !defined(HAVE_IOKIT)
+free_context:
+#endif
 	free(context);
 
 	return IRECV_E_SUCCESS;
